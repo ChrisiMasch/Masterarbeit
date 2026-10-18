@@ -1,0 +1,201 @@
+#%%
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import expm
+#%%
+# Konstanten
+J = 1.0
+a1 = np.array([ np.sqrt(3)/2, 1.5]) #Gittervektoren
+a2 = np.array([-np.sqrt(3)/2, 1.5])
+dAB = np.array([0.0, 1.0]) #B-Platz relativ zum A-Platz in derselben Zell
+
+# Gitter bauen
+def honeycomb(L1, L2, periodic=False):
+
+    def idx(n1, n2, s):
+        return 2*(n1*L2 + n2) + s
+    
+
+    N = 2*L1*L2 #Anzahl der Gitterplätze
+    pos = np.zeros((N, 2))
+    bonds = []
+
+    for n1 in range(L1):
+        for n2 in range(L2):
+            R = n1*a1 + n2*a2
+            pos[idx(n1, n2, 0)] = R
+            pos[idx(n1, n2, 1)] = R + dAB
+            for c1, c2 in [(0, 0), (-1, 0), (0, -1)]:
+                m1, m2 = n1 + c1, n2 + c2
+                if periodic[0]: m1 %= L1
+                if periodic[1]: m2 %= L2
+                if not (0 <= m1 < L1 and 0 <= m2 < L2):
+                    continue
+                delta = dAB + c1*a1 + c2*a2
+                bonds.append((idx(n1, n2, 0), idx(m1, m2, 1), delta))
+    iA = np.array([b[0] for b in bonds])
+    iB = np.array([b[1] for b in bonds])
+    D  = np.array([b[2] for b in bonds])
+    return pos, iA, iB, D
+
+# Gitter erzeugen und zeichnen
+pos, iA, iB, D = honeycomb(9, 9, periodic=[True, True])
+#%%
+for i, j in zip(iA, iB):
+    plt.plot(*pos[[i, j]].T, 'k-', lw=0.8)
+plt.scatter(*pos[0::2].T, c='tab:red',  label='A', zorder=3)
+plt.scatter(*pos[1::2].T, c='tab:blue', label='B', zorder=3)
+plt.axis('equal'); plt.legend(); plt.show()
+
+# %%
+#Hamiltonian:
+def H_static(N, iA, iB):
+    H = np.zeros((N, N))
+    H[iB, iA] = -J      # Tunneln von A nach B
+    H[iA, iB] = -J      # Tunneln von B nach A (macht H hermitesch)
+    return H
+
+L = 9
+pos, iA, iB, D = honeycomb(L, L, periodic=(True, True))
+N = 2*L*L
+H0 = H_static(N, iA, iB)
+E = np.linalg.eigvalsh(H0)
+
+print(np.allclose(H0, H0.T))               # 1. hermitesch (hier reell, also symmetrisch)
+print(np.all((H0 != 0).sum(axis=1) == 3))  # 2. jeder Platz hat 3 Nachbarn
+print(E.min(), E.max())                     # 3. genau -3 und +3
+print(np.allclose(E, -E[::-1]))             # 4. Spektrum symmetrisch
+print(np.sum(np.abs(E) < 1e-10))            # 5. Dirac-Punkte: 4 Nullen
+# %%
+def H_t(t, N, iA, iB, D, K0, w):
+    A = K0 * np.array([np.cos(w*t), np.sin(w*t)])   # Vektorpotential zur Zeit t
+    h = -J * np.exp(1j * D @ A)                      # ein Wert pro Bindung
+    H = np.zeros((N, N), dtype=complex)
+    H[iB, iA] = h
+    H[iA, iB] = np.conj(h)
+    return H
+
+w, K0 = 10.0, 1.0
+T = 2*np.pi / w
+
+Ht = H_t(0.3, N, iA, iB, D, K0, w)
+print(np.allclose(Ht, Ht.conj().T))                                  # 1. hermitesch
+print(np.allclose(H_t(0.3, N, iA, iB, D, 0.0, w), H0))               # 2. K0=0 gibt H0
+print(np.allclose(H_t(0.3, N, iA, iB, D, K0, w),
+                  H_t(0.3 + T, N, iA, iB, D, K0, w)))                # 3. periodisch in T
+print(np.allclose(np.abs(Ht[iB, iA]), J))                            # 4. Betrag bleibt J
+# %%
+import qutip as qt
+
+def make_coeff(K0, w, phi, sign):
+    def c(t):
+        return np.exp(sign * 1j * K0 * np.cos(w*t + phi))
+    return c
+
+def H_qutip(N, iA, iB, D, K0, w):
+    phis = np.round(np.arctan2(D[:, 1], D[:, 0]), 6)   # Winkel jeder Bindung
+    H = []
+    for phi in np.unique(phis):                          # die 3 Richtungen
+        sel = (phis == phi)                              # Bindungen dieser Richtung
+        M = np.zeros((N, N), dtype=complex)
+        M[iB[sel], iA[sel]] = -J                         # A -> B
+        Mq = qt.Qobj(M)
+        H.append([Mq,       make_coeff(K0, w, phi, +1)])
+        H.append([Mq.dag(), make_coeff(K0, w, phi, -1)]) # B -> A
+    return H
+
+# Rechnen
+L = 4
+pos, iA, iB, D = honeycomb(L, L, periodic=(True, True))
+N = 2*L*L
+w, K0 = 10.0, 1.0
+T = 2*np.pi / w
+
+fb = qt.FloquetBasis(H_qutip(N, iA, iB, D, K0, w), T)
+eps_qutip = fb.e_quasi
+# %%
+def floquet_U(N, iA, iB, D, K0, w, Nt=200):
+    T = 2*np.pi / w
+    dt = T / Nt
+    U = np.eye(N, dtype=complex)
+    for n in range(Nt):
+        t = (n + 0.5) * dt
+        U = expm(-1j * H_t(t, N, iA, iB, D, K0, w) * dt) @ U
+    return U
+
+def quasienergies(U, w):
+    T = 2*np.pi / w
+    lam = np.linalg.eigvals(U)
+    return np.sort(-np.angle(lam) / T)
+eps_eigen = quasienergies(floquet_U(N, iA, iB, D, K0, w, Nt=400), w)
+
+print(np.max(np.abs(np.sort(eps_qutip) - eps_eigen)))   # sollte klein sein (~1e-4 oder besser)
+
+# %%
+# %%
+# Lücke an den Dirac-Punkten vs. Frequenz
+L = 6                                   # Vielfaches von 3!
+pos, iA, iB, D = honeycomb(L, L, periodic=(True, True))
+N = 2*L*L
+
+for K0 in [1.0, 0.0]:                   # mit Antrieb, und als Gegenprobe ohne
+    print(f"K0 = {K0}")
+    for w in [12, 16, 20, 30]:
+        T = 2*np.pi / w
+        eps = qt.FloquetBasis(H_qutip(N, iA, iB, D, K0, w), T).e_quasi
+        vier = np.sort(np.abs(eps))[:4]     # die 4 Zustände nächst an 0
+        Delta = 2 * vier.mean()
+        print(f"  w = {w:4.0f}   Luecke = {Delta:.5f}   Luecke*w = {Delta*w:.4f}")
+# %%
+def make_coeff(K0, w, phi, sign, kphase=0.0):
+    def c(t):
+        return np.exp(sign * 1j * (K0 * np.cos(w*t + phi) + kphase))
+    return c
+
+def H_qutip(N, iA, iB, D, K0, w, k=np.zeros(2)):
+    phis = np.round(np.arctan2(D[:, 1], D[:, 0]), 6)
+    H = []
+    for phi in np.unique(phis):
+        sel = (phis == phi)
+        delta = D[sel][0]                       # Bindungsvektor dieser Richtung
+        kphase = k @ delta                      # Bloch-Phase
+        M = np.zeros((N, N), dtype=complex)
+        M[iB[sel], iA[sel]] = -J
+        Mq = qt.Qobj(M)
+        H.append([Mq,       make_coeff(K0, w, phi, +1, kphase)])
+        H.append([Mq.dag(), make_coeff(K0, w, phi, -1, kphase)])
+    return H
+# %%
+# %%
+L2 = 20                                # Breite des Streifens (Zellen)
+pos, iA, iB, D = honeycomb(1, L2, periodic=(True, False))
+N = 2*L2
+b1 = np.array([2*np.pi/np.sqrt(3), 2*np.pi/3])
+
+w, K0 = 12.0, 1.0
+T = 2*np.pi / w
+rand = 5                                   # so viele Zellen zählen als "Rand"
+n2 = np.arange(N) // 2                     # Zeilennummer jedes Platzes
+
+thetas = np.linspace(-np.pi, np.pi, 61)
+TH, EPS, COL = [], [], []
+for th in thetas:
+    k = th/(2*np.pi) * b1
+    fb = qt.FloquetBasis(H_qutip(N, iA, iB, D, K0, w, k), T)
+    modes = np.array([m.full().ravel() for m in fb.mode(0)])   # Zeilen = Zustände
+    dichte = np.abs(modes)**2
+    oben  = dichte[:, n2 >= L2 - rand].sum(axis=1)
+    unten = dichte[:, n2 <  rand].sum(axis=1)
+    TH  += [th] * N
+    EPS += list(fb.e_quasi)
+    COL += list(oben - unten)
+
+plt.scatter(TH, EPS, c=COL, cmap='coolwarm', vmin=-1, vmax=1, s=4)
+plt.colorbar(label='oben − unten')
+plt.xlabel('θ (Impuls entlang des Randes)'); plt.ylabel('Quasienergie / J')
+#plt.ylim(-1, 1)                            # Zoom auf die Lücke
+for m in [-1, 0, 1]:
+    plt.scatter(TH, np.array(EPS) + m*w, c=COL, cmap='coolwarm', vmin=-1, vmax=1, s=4)
+plt.ylim(-1.5*w, 1.5*w)
+plt.show()
+# %%
